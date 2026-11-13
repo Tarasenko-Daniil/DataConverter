@@ -1,0 +1,4 @@
+[
+  { "id": "1", "name": "Анна", "note": null, "empty": "" },
+  { "id": "2", "name": "Smith, \"J\"", "note": "line1\nline2", "empty": "" }
+]

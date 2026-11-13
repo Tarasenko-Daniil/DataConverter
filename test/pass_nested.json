@@ -1,0 +1,14 @@
+[
+  {
+    "id": 1, "name": "Анна", "active": true, "score": 4.5, "note": null,
+    "address": { "city": "Helsinki", "zip": "00100" },
+    "tags": ["a", "b", "c"],
+    "phones": [ { "type": "home", "n": "123" }, { "type": "work", "n": "456" } ]
+  },
+  {
+    "id": 2, "name": "Bob \"The Builder\"", "active": false, "score": 0, "note": "multi\nline",
+    "address": { "city": "Oslo", "zip": "0150" },
+    "tags": ["x", "y", "z"],
+    "phones": [ { "type": "home", "n": "789" }, { "type": "work", "n": "000" } ]
+  }
+]

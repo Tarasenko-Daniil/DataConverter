@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<!DOCTYPE root [<!ENTITY x "boom">]>
+<root><record><a>&x;</a></record></root>
