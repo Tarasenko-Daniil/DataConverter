@@ -1,4 +1,4 @@
-﻿using DataConverter.Exceptions;
+using DataConverter.Exceptions;
 using DataConverter.Models;
 
 namespace DataConverter.Base;
@@ -6,19 +6,41 @@ namespace DataConverter.Base;
 public abstract class RecordReaderBase : IRecordReader
 {
     public abstract string FormatName { get; }
- 
-    public IReadOnlyList<DataRecord> Read(TextReader input)
+
+    public IEnumerable<DataRecord> Read(TextReader input)
     {
         ArgumentNullException.ThrowIfNull(input);
- 
+
+        IEnumerator<DataRecord> enumerator = ReadCore(input).GetEnumerator();
+
         try
         {
-            return ReadCore(input);
+            while (true)
+            {
+                DataRecord current;
+
+                try
+                {
+                    if (enumerator.MoveNext() == false)
+                    {
+                        yield break;
+                    }
+
+                    current = enumerator.Current;
+                }
+                catch (IOException ex)
+                {
+                    throw new ReadException($"Ошибка чтения {FormatName}: {ex.Message}", ex);
+                }
+
+                yield return current;
+            }
         }
-        catch (IOException ex)
+        finally
         {
-            throw new ReadException($"Ошибка чтения {FormatName}: {ex.Message}", ex);
+            enumerator.Dispose();
         }
     }
-    public abstract IReadOnlyList<DataRecord> ReadCore(TextReader input);
+
+    protected abstract IEnumerable<DataRecord> ReadCore(TextReader input);
 }
