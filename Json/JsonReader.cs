@@ -1,144 +1,524 @@
-﻿using System.Text.Json;
+﻿using System.Text;
+using System.Text.Json;
 using DataConverter.Base;
 using DataConverter.Exceptions;
 using DataConverter.Formats;
 using DataConverter.Models;
 
 namespace DataConverter.Json;
- 
-public class JsonRecordReader : RecordReaderBase
+
+public sealed class JsonRecordReader : RecordReaderBase
 {
-    private string? _recordPath;
- 
+    private readonly string? _recordPath;
+
     public JsonRecordReader(FormatOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
         _recordPath = options.RecordPath;
     }
- 
+
     public override string FormatName
     {
-        get
-        {
-            return "json";
-        }
-    } 
-    public override IReadOnlyList<DataRecord> ReadCore(TextReader input)
+        get { return "json"; }
+    }
+
+    protected override IEnumerable<DataRecord> ReadCore(TextReader input)
     {
-        var text = input.ReadToEnd();
- 
+        JsonScanner scanner = new JsonScanner(input);
+        scanner.SkipWhitespace();
+
+        if (scanner.Peek() < 0)
+            throw new InvalidSourceFormatException("JSON", "документ пуст.");
+
+        int first = scanner.Peek();
+
+        if (first != '{' && first != '[')
+            throw new InvalidSourceFormatException("JSON", "ожидался объект или массив.", scanner.Line);
+
+        if (string.IsNullOrWhiteSpace(_recordPath) == false)
+            MoveToValue(scanner, _recordPath!);
+
+        int kind = scanner.Peek();
+
+        if (kind == '[')
+        {
+            foreach (DataRecord record in ReadArray(scanner))
+                yield return record;
+
+            yield break;
+        }
+
+        if (kind == '{')
+        {
+            yield return ReadObject(scanner, "документ");
+            yield break;
+        }
+
+        throw new InvalidSourceFormatException("JSON", "ожидался массив объектов или объект.", scanner.Line);
+    }
+
+    private static IEnumerable<DataRecord> ReadArray(JsonScanner scanner)
+    {
+        scanner.Read();
+        scanner.SkipWhitespace();
+
+        if (scanner.Peek() == ']')
+        {
+            scanner.Read();
+            yield break;
+        }
+
+        int index = 0;
+
+        while (true)
+        {
+            index++;
+            yield return ReadObject(scanner, "элемент массива №" + index);
+
+            scanner.SkipWhitespace();
+            int separator = scanner.Peek();
+
+            if (separator == ',')
+            {
+                scanner.Read();
+                scanner.SkipWhitespace();
+                continue;
+            }
+
+            if (separator == ']')
+            {
+                scanner.Read();
+                yield break;
+            }
+
+            throw new InvalidSourceFormatException("JSON",
+                "ожидалась запятая или закрывающая скобка массива.", scanner.Line);
+        }
+    }
+
+    private static DataRecord ReadObject(JsonScanner scanner, string place)
+    {
+        int startLine = scanner.Line;
+        string raw = scanner.ReadValueRaw();
+
+        JsonDocument? document = null;
+
         try
         {
-            var options = new JsonDocumentOptions();
-            options.CommentHandling = JsonCommentHandling.Skip;
-            options.AllowTrailingCommas = false;
+            document = JsonDocument.Parse(raw);
 
-             var document = JsonDocument.Parse(text, options);
-             var root = document.RootElement;
-             var place = Locate(root);
-             var records = ToRecords(place);
-             return records;
+            object? value = ConvertValue(document.RootElement);
+            DataRecord? record = value as DataRecord;
+
+            if (record == null)
+                throw new InvalidSourceFormatException("JSON", place + " не является объектом.", startLine);
+
+            return record;
         }
         catch (JsonException ex)
         {
-            int? line;
+            int line = startLine + (int)(ex.LineNumber ?? 0);
+            throw new InvalidSourceFormatException("JSON", ex.Message, line, ex);
+        }
+        finally
+        {
+            if (document != null)
+                document.Dispose();
+        }
+    }
 
-            if (ex.LineNumber is long l)
+    private static void MoveToValue(JsonScanner scanner, string path)
+    {
+        string[] segments = path.Split('.');
+
+        foreach (string segment in segments)
+        {
+            if (scanner.Peek() != '{')
+                throw new RecordPathNotFoundException(path);
+
+            scanner.Read();
+            bool found = false;
+
+            while (true)
             {
-                line = (int)l + 1;
+                scanner.SkipWhitespace();
+                int next = scanner.Peek();
+
+                if (next == '}')
+                {
+                    scanner.Read();
+                    break;
+                }
+
+                if (next != '"')
+                    throw new InvalidSourceFormatException("JSON", "ожидалось имя свойства.", scanner.Line);
+
+                string key = scanner.ReadStringLiteral();
+
+                scanner.SkipWhitespace();
+
+                if (scanner.Peek() != ':')
+                    throw new InvalidSourceFormatException("JSON", "ожидалось ':' после имени свойства.", scanner.Line);
+
+                scanner.Read();
+                scanner.SkipWhitespace();
+
+                if (key == segment)
+                {
+                    found = true;
+                    break;
+                }
+
+                scanner.ReadValueRaw();
+                scanner.SkipWhitespace();
+
+                int after = scanner.Peek();
+
+                if (after == ',')
+                {
+                    scanner.Read();
+                    continue;
+                }
+
+                if (after == '}')
+                {
+                    scanner.Read();
+                    break;
+                }
+
+                throw new InvalidSourceFormatException("JSON", "ожидалась запятая или '}'.", scanner.Line);
+            }
+
+            if (found == false)
+                throw new RecordPathNotFoundException(path);
+        }
+    }
+
+    private static object? ConvertValue(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            DataRecord record = new DataRecord();
+
+            foreach (JsonProperty property in element.EnumerateObject())
+            {
+                record.Set(property.Name, ConvertValue(property.Value));
+            }
+
+            return record;
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            List<object?> list = new List<object?>();
+
+            foreach (JsonElement item in element.EnumerateArray())
+            {
+                list.Add(ConvertValue(item));
+            }
+
+            return list;
+        }
+
+        if (element.ValueKind == JsonValueKind.String)
+            return element.GetString();
+
+        if (element.ValueKind == JsonValueKind.True)
+            return true;
+
+        if (element.ValueKind == JsonValueKind.False)
+            return false;
+
+        if (element.ValueKind == JsonValueKind.Number)
+        {
+            long longValue;
+
+            if (element.TryGetInt64(out longValue))
+                return longValue;
+
+            decimal decimalValue;
+
+            if (element.TryGetDecimal(out decimalValue))
+                return decimalValue;
+
+            return element.GetDouble();
+        }
+
+        return null;
+    }
+
+    private sealed class JsonScanner
+    {
+        private const int NothingPeeked = -2;
+
+        private readonly TextReader _input;
+        private int _line = 1;
+        private int _lookedAhead = NothingPeeked;
+
+        public JsonScanner(TextReader input)
+        {
+            _input = input;
+        }
+
+        public int Line
+        {
+            get { return _line; }
+        }
+
+        public int Peek()
+        {
+            if (_lookedAhead == NothingPeeked)
+                _lookedAhead = _input.Peek();
+
+            return _lookedAhead;
+        }
+
+        public int Read()
+        {
+            int symbol;
+
+            if (_lookedAhead != NothingPeeked)
+            {
+                symbol = _lookedAhead;
+                _lookedAhead = NothingPeeked;
+
+                if (symbol >= 0)
+                    _input.Read();
             }
             else
             {
-                line = null;
-            }            throw new InvalidSourceFormatException("JSON", ex.Message, line, ex);
+                symbol = _input.Read();
+            }
+
+            if (symbol == '\n')
+                _line++;
+
+            return symbol;
         }
-    }
- 
-    private JsonElement Locate(JsonElement root)
-    {
-        if (string.IsNullOrWhiteSpace(_recordPath))
-            return root;
- 
-        var current = root;
-        foreach (var segment in _recordPath.Split('.'))
+
+        public void SkipWhitespace()
         {
-            if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(segment, out var next))
-                throw new RecordPathNotFoundException(_recordPath);
-            current = next;
-        }
- 
-        return current;
-    }
- 
-    private static IReadOnlyList<DataRecord> ToRecords(JsonElement element)
-    {
-        switch (element.ValueKind)
-        {
-            case JsonValueKind.Array:
-                var records = new List<DataRecord>(element.GetArrayLength());
-                var index = 0;
-                foreach (var item in element.EnumerateArray())
+            while (true)
+            {
+                int symbol = Peek();
+
+                if (symbol == ' ' || symbol == '\t' || symbol == '\r' || symbol == '\n')
                 {
-                    if (item.ValueKind != JsonValueKind.Object)
-                        throw new InvalidSourceFormatException("JSON", $"элемент массива №{index + 1} не является объектом ({item.ValueKind}).");
-                    var converted = ConvertValue(item);
-                    if (converted is DataRecord dataRecord)
+                    Read();
+                    continue;
+                }
+
+                return;
+            }
+        }
+
+        public string ReadStringLiteral()
+        {
+            Read();
+
+            StringBuilder text = new StringBuilder();
+
+            while (true)
+            {
+                int symbol = Read();
+
+                if (symbol < 0)
+                    throw new InvalidSourceFormatException("JSON", "не закрыта строка.", Line);
+
+                if (symbol == '"')
+                    return text.ToString();
+
+                if (symbol != '\\')
+                {
+                    text.Append((char)symbol);
+                    continue;
+                }
+
+                int escape = Read();
+
+                if (escape < 0)
+                    throw new InvalidSourceFormatException("JSON", "не закрыта строка.", Line);
+
+                if (escape == '"') { text.Append('"'); continue; }
+                if (escape == '\\') { text.Append('\\'); continue; }
+                if (escape == '/') { text.Append('/'); continue; }
+                if (escape == 'b') { text.Append('\b'); continue; }
+                if (escape == 'f') { text.Append('\f'); continue; }
+                if (escape == 'n') { text.Append('\n'); continue; }
+                if (escape == 'r') { text.Append('\r'); continue; }
+                if (escape == 't') { text.Append('\t'); continue; }
+
+                if (escape == 'u')
+                {
+                    text.Append(ReadHexChar());
+                    continue;
+                }
+
+                throw new InvalidSourceFormatException("JSON",
+                    $"неизвестная escape-последовательность \\{(char)escape}.", Line);
+            }
+        }
+
+        public string ReadValueRaw()
+        {
+            int first = Peek();
+
+            if (first < 0)
+                throw new InvalidSourceFormatException("JSON", "неожиданный конец файла.", Line);
+
+            if (first == '{' || first == '[')
+                return ReadBalanced();
+
+            if (first == '"')
+                return ReadStringRaw();
+
+            StringBuilder text = new StringBuilder();
+
+            while (true)
+            {
+                int symbol = Peek();
+
+                if (symbol < 0 || symbol == ',' || symbol == ']' || symbol == '}' ||
+                    symbol == ' ' || symbol == '\t' || symbol == '\r' || symbol == '\n')
+                {
+                    break;
+                }
+
+                text.Append((char)Read());
+            }
+
+            if (text.Length == 0)
+                throw new InvalidSourceFormatException("JSON", "ожидалось значение.", Line);
+
+            return text.ToString();
+        }
+
+        private string ReadBalanced()
+        {
+            StringBuilder text = new StringBuilder();
+            int depth = 0;
+            bool insideString = false;
+            bool escaped = false;
+
+            while (true)
+            {
+                int symbol = Read();
+
+                if (symbol < 0)
+                    throw new InvalidSourceFormatException("JSON", "неожиданный конец файла.", Line);
+
+                text.Append((char)symbol);
+
+                if (insideString)
+                {
+                    if (escaped)
                     {
-                        records.Add(dataRecord);
-                    }                    
-                    index++;
-                }
-                return records;
- 
-            case JsonValueKind.Object:
-                var convert = ConvertValue(element);
+                        escaped = false;
+                        continue;
+                    }
 
-                if (convert is DataRecord record)
+                    if (symbol == '\\')
+                    {
+                        escaped = true;
+                        continue;
+                    }
+
+                    if (symbol == '"')
+                        insideString = false;
+
+                    continue;
+                }
+
+                if (symbol == '"')
                 {
-                    var result = new List<DataRecord>();
-                    result.Add(record);
-                    return result;
+                    insideString = true;
+                    continue;
                 }
 
-                throw new InvalidSourceFormatException("JSON", "не удалось разобрать объект.");
- 
-            default:
-                throw new InvalidSourceFormatException("JSON", $"ожидался массив объектов или объект, получено: {element.ValueKind}.");
+                if (symbol == '{' || symbol == '[')
+                {
+                    depth++;
+                    continue;
+                }
+
+                if (symbol == '}' || symbol == ']')
+                {
+                    depth--;
+
+                    if (depth < 0)
+                        throw new InvalidSourceFormatException("JSON", "лишняя закрывающая скобка.", Line);
+
+                    if (depth == 0)
+                        return text.ToString();
+                }
+            }
         }
-    }
- 
-    private static object? ConvertValue(JsonElement e)
-    {
-        switch (e.ValueKind)
+
+        private string ReadStringRaw()
         {
-            case JsonValueKind.Object:
-                var record = new DataRecord();
-                foreach (var property in e.EnumerateObject())
-                    record.Set(property.Name, ConvertValue(property.Value));
-                return record;
- 
-            case JsonValueKind.Array:
-                var list = new List<object?>();
-                foreach (var item in e.EnumerateArray())
-                    list.Add(ConvertValue(item));
-                return list;
- 
-            case JsonValueKind.String: return e.GetString();
-            case JsonValueKind.True: return true;
-            case JsonValueKind.False: return false;
- 
-            case JsonValueKind.Number:
-                if (e.TryGetInt64(out var l))
+            StringBuilder text = new StringBuilder();
+            text.Append('"');
+
+            Read();
+
+            bool escaped = false;
+
+            while (true)
+            {
+                int symbol = Read();
+
+                if (symbol < 0)
+                    throw new InvalidSourceFormatException("JSON", "не закрыта строка.", Line);
+
+                text.Append((char)symbol);
+
+                if (escaped)
                 {
-                    return l;
+                    escaped = false;
+                    continue;
                 }
-                if (e.TryGetDecimal(out var d))
+
+                if (symbol == '\\')
                 {
-                    return d;
+                    escaped = true;
+                    continue;
                 }
-                return e.GetDouble();
- 
-            default: return null;
+
+                if (symbol == '"')
+                    return text.ToString();
+            }
+        }
+
+        private char ReadHexChar()
+        {
+            int value = 0;
+
+            for (int i = 0; i < 4; i++)
+            {
+                int symbol = Read();
+                int digit = HexDigit(symbol);
+
+                if (digit < 0)
+                    throw new InvalidSourceFormatException("JSON", "ожидались 4 шестнадцатеричные цифры.", Line);
+
+                value = value * 16 + digit;
+            }
+
+            return (char)value;
+        }
+
+        private static int HexDigit(int symbol)
+        {
+            if (symbol >= '0' && symbol <= '9')
+                return symbol - '0';
+
+            if (symbol >= 'a' && symbol <= 'f')
+                return symbol - 'a' + 10;
+
+            if (symbol >= 'A' && symbol <= 'F')
+                return symbol - 'A' + 10;
+
+            return -1;
         }
     }
 }
